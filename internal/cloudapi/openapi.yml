@@ -318,6 +318,9 @@ components:
           type: string
           format: password
           example: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+        session_token:
+          type: string
+          example: 'FwoGZXIvYXdzEAIaDOBHKntLxUxZxScLtSJqmNWZLFbP3cWHvwGwc1X+UqcoPn9pPAtMRSBbxJjvNU0DqIMwdHqrWdPxfUL8Hkesd5H3L+e47xwU3U1v8DruFJXNyo7zHq+ylkkiN+7YnWUyzkpOSD7f122RWZ1YBXJljTaAyQrI2HynLyip05KJBjIooDfiRtHw9cMhl5+ERC2EmoIjKWmZu5rW0gzF9IVDaHfkd+awAsbLEw=='
         bucket:
           type: string
           example: 'my-bucket'
@@ -334,6 +337,9 @@ components:
           type: string
           format: password
           example: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+        session_token:
+          type: string
+          example: 'FwoGZXIvYXdzEAIaDOBHKntLxUxZxScLtSJqmNWZLFbP3cWHvwGwc1X+UqcoPn9pPAtMRSBbxJjvNU0DqIMwdHqrWdPxfUL8Hkesd5H3L+e47xwU3U1v8DruFJXNyo7zHq+ylkkiN+7YnWUyzkpOSD7f122RWZ1YBXJljTaAyQrI2HynLyip05KJBjIooDfiRtHw9cMhl5+ERC2EmoIjKWmZu5rW0gzF9IVDaHfkd+awAsbLEw=='
         snapshot_name:
           type: string
           example: 'my-snapshot'
