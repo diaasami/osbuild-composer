@@ -35,8 +35,7 @@ require (
 	github.com/julienschmidt/httprouter v1.3.0
 	github.com/kolo/xmlrpc v0.0.0-20201022064351-38db28db192b
 	github.com/labstack/echo/v4 v4.5.0
-	github.com/mattn/go-isatty v0.0.13 // indirect
-	github.com/openshift-online/ocm-sdk-go v0.1.204
+	github.com/openshift-online/ocm-sdk-go v0.1.224
 	github.com/prometheus/client_golang v1.11.0
 	github.com/prometheus/common v0.30.0 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
@@ -53,5 +52,4 @@ require (
 	google.golang.org/genproto v0.0.0-20210903162649-d08c68adba83
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/ini.v1 v1.63.0
-	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 )
