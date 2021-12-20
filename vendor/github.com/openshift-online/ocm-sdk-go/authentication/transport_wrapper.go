@@ -22,6 +22,7 @@ package authentication
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"sync"
 
@@ -36,6 +37,7 @@ import (
 	//
 	"github.com/cenkalti/backoff/v4"
 	jwt "github.com/golang-jwt/jwt"
+	"github.com/google/uuid"
 	"github.com/openshift-online/ocm-sdk-go/internal"
 	"github.com/openshift-online/ocm-sdk-go/logging"
 	"github.com/prometheus/client_golang/prometheus"
@@ -80,20 +82,21 @@ type TransportWrapperBuilder struct {
 // one that adds authorization tokens to requests.
 type TransportWrapper struct {
 	// Fields used for basic functionality:
-	logger         logging.Logger
-	clientID       string
-	clientSecret   string
-	user           string
-	password       string
-	scopes         []string
-	agent          string
-	clientSelector *internal.ClientSelector
-	tokenURL       string
-	tokenServer    *internal.ServerAddress
-	tokenMutex     *sync.Mutex
-	tokenParser    *jwt.Parser
-	accessToken    *jwt.Token
-	refreshToken   *jwt.Token
+	logger                logging.Logger
+	clientID              string
+	clientSecret          string
+	user                  string
+	password              string
+	scopes                []string
+	agent                 string
+	clientSelector        *internal.ClientSelector
+	tokenURL              string
+	tokenServer           *internal.ServerAddress
+	tokenMutex            *sync.Mutex
+	tokenParser           *jwt.Parser
+	accessToken           *tokenInfo
+	refreshToken          *tokenInfo
+	pullSecretAccessToken *tokenInfo
 
 	// Fields used for metrics:
 	metricsSubsystem    string
@@ -337,39 +340,104 @@ func (b *TransportWrapperBuilder) Build(ctx context.Context) (result *TransportW
 		return
 	}
 
+	// Create the token parser:
+	tokenParser := &jwt.Parser{}
+
 	// Parse the tokens:
-	tokenParser := new(jwt.Parser)
-	var accessToken *jwt.Token
-	var refreshToken *jwt.Token
+	var accessToken *tokenInfo
+	var refreshToken *tokenInfo
+	var pullSecretAccessToken *tokenInfo
 	for i, text := range b.tokens {
-		var token *jwt.Token
-		token, _, err = tokenParser.ParseUnverified(text, jwt.MapClaims{})
+		var object *jwt.Token
+
+		object, _, err = tokenParser.ParseUnverified(text, jwt.MapClaims{})
 		if err != nil {
-			err = fmt.Errorf("can't parse token %d: %w", i, err)
-			return
+			b.logger.Debug(
+				ctx,
+				"Can't parse token %d, will assume that it is either an "+
+					"opaque refresh token or pull secret access token: %v",
+				i, err,
+			)
+
+			// Attempt to detect/parse the token as a pull-secret access token
+			err := parsePullSecretAccessToken(text)
+			if err != nil {
+				b.logger.Debug(
+					ctx,
+					"Can't parse pull secret access token %d, will assume "+
+						"that it is an opaque refresh token: %v",
+					i, err,
+				)
+
+				// Not a pull-secret access token, so assume a opaque refresh token
+				refreshToken = &tokenInfo{
+					text: text,
+				}
+				continue
+			}
+
+			// Parsing as a pull-secret access token was successful, treat it as such
+			pullSecretAccessToken = &tokenInfo{
+				text: text,
+			}
+			continue
 		}
-		claims, ok := token.Claims.(jwt.MapClaims)
+
+		claims, ok := object.Claims.(jwt.MapClaims)
 		if !ok {
 			err = fmt.Errorf("claims of token %d are of type '%T'", i, claims)
 			return
 		}
 		claim, ok := claims["typ"]
 		if !ok {
-			err = fmt.Errorf("token %d doesn't contain the 'typ' claim", i)
-			return
+			// When the token doesn't have the `typ` claim we will use the position to
+			// decide: first token should be the access token and second should be the
+			// refresh token. That is consistent with the signature of the method that
+			// returns the tokens.
+			switch i {
+			case 0:
+				b.logger.Debug(
+					ctx,
+					"First token doesn't have a 'typ' claim, will assume "+
+						"that it is an access token",
+				)
+				accessToken = &tokenInfo{
+					text:   text,
+					object: object,
+				}
+				continue
+			case 1:
+				b.logger.Debug(
+					ctx,
+					"Second token doesn't have a 'typ' claim, will assume "+
+						"that it is a refresh token",
+				)
+				refreshToken = &tokenInfo{
+					text:   text,
+					object: object,
+				}
+				continue
+			default:
+				err = fmt.Errorf("token %d doesn't contain the 'typ' claim", i)
+				return
+			}
 		}
 		typ, ok := claim.(string)
 		if !ok {
 			err = fmt.Errorf("claim 'type' of token %d is of type '%T'", i, claim)
 			return
 		}
-		switch {
-		case strings.EqualFold(typ, "Bearer"):
-			accessToken = token
-		case strings.EqualFold(typ, "Refresh"):
-			refreshToken = token
-		case strings.EqualFold(typ, "Offline"):
-			refreshToken = token
+		switch strings.ToLower(typ) {
+		case "bearer":
+			accessToken = &tokenInfo{
+				text:   text,
+				object: object,
+			}
+		case "refresh", "offline":
+			refreshToken = &tokenInfo{
+				text:   text,
+				object: object,
+			}
 		default:
 			err = fmt.Errorf("type '%s' of token %d is unknown", typ, i)
 			return
@@ -482,24 +550,25 @@ func (b *TransportWrapperBuilder) Build(ctx context.Context) (result *TransportW
 
 	// Create and populate the object:
 	result = &TransportWrapper{
-		logger:              b.logger,
-		clientID:            clientID,
-		clientSecret:        clientSecret,
-		user:                b.user,
-		password:            b.password,
-		scopes:              scopes,
-		agent:               b.agent,
-		clientSelector:      clientSelector,
-		tokenURL:            tokenURL,
-		tokenServer:         tokenServer,
-		tokenMutex:          &sync.Mutex{},
-		tokenParser:         tokenParser,
-		accessToken:         accessToken,
-		refreshToken:        refreshToken,
-		metricsSubsystem:    b.metricsSubsystem,
-		metricsRegisterer:   b.metricsRegisterer,
-		tokenCountMetric:    tokenCountMetric,
-		tokenDurationMetric: tokenDurationMetric,
+		logger:                b.logger,
+		clientID:              clientID,
+		clientSecret:          clientSecret,
+		user:                  b.user,
+		password:              b.password,
+		scopes:                scopes,
+		agent:                 b.agent,
+		clientSelector:        clientSelector,
+		tokenURL:              tokenURL,
+		tokenServer:           tokenServer,
+		tokenMutex:            &sync.Mutex{},
+		tokenParser:           tokenParser,
+		accessToken:           accessToken,
+		refreshToken:          refreshToken,
+		pullSecretAccessToken: pullSecretAccessToken,
+		metricsSubsystem:      b.metricsSubsystem,
+		metricsRegisterer:     b.metricsRegisterer,
+		tokenCountMetric:      tokenCountMetric,
+		tokenDurationMetric:   tokenDurationMetric,
 	}
 
 	return
@@ -572,8 +641,16 @@ func (t *roundTripper) RoundTrip(request *http.Request) (response *http.Response
 	if request.Header == nil {
 		request.Header = make(http.Header)
 	}
+
+	// If the access token is a pull-secret-access-token type, a
+	// different Authorization header must be used
 	if token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
+		if err := parsePullSecretAccessToken(token); err == nil {
+			// It is a pull-secret access token
+			request.Header.Set("Authorization", "AccessToken "+token)
+		} else {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 
 	// Call the wrapped transport:
@@ -647,12 +724,18 @@ func (w *TransportWrapper) tokens(ctx context.Context, attempt int,
 	w.tokenMutex.Lock()
 	defer w.tokenMutex.Unlock()
 
+	// A pull-secret access token can just be used as-is
+	if w.pullSecretAccessToken != nil {
+		access = w.pullSecretAccessToken.text
+		return
+	}
+
 	// Check the expiration times of the tokens:
 	now := time.Now()
 	var accessExpires bool
-	var accessReamining time.Duration
+	var accessRemaining time.Duration
 	if w.accessToken != nil {
-		accessExpires, accessReamining, err = tokenRemaining(w.accessToken, now)
+		accessExpires, accessRemaining, err = tokenRemaining(w.accessToken, now)
 		if err != nil {
 			return
 		}
@@ -666,13 +749,13 @@ func (w *TransportWrapper) tokens(ctx context.Context, attempt int,
 		}
 	}
 	if w.logger.DebugEnabled() {
-		w.debugExpiry(ctx, "Bearer", w.accessToken, accessExpires, accessReamining)
+		w.debugExpiry(ctx, "Bearer", w.accessToken, accessExpires, accessRemaining)
 		w.debugExpiry(ctx, "Refresh", w.refreshToken, refreshExpires, refreshRemaining)
 	}
 
 	// If the access token is available and it isn't expired or about to expire then we can
 	// return the current tokens directly:
-	if w.accessToken != nil && (!accessExpires || accessReamining >= minRemaining) {
+	if w.accessToken != nil && (!accessExpires || accessRemaining >= minRemaining) {
 		access, refresh = w.currentTokens()
 		return
 	}
@@ -739,12 +822,12 @@ func (w *TransportWrapper) tokens(ctx context.Context, attempt int,
 	// that the refresh token is unavailable or completely expired. And we know that we don't
 	// have credentials to request new tokens. But we can still use the access token if it isn't
 	// expired.
-	if w.accessToken != nil && accessReamining > 0 {
+	if w.accessToken != nil && accessRemaining > 0 {
 		w.logger.Warn(
 			ctx,
 			"Access token expires in only %s, but there is no other mechanism to "+
 				"obtain a new token, so will try to use it anyhow",
-			accessReamining,
+			accessRemaining,
 		)
 		access, refresh = w.currentTokens()
 		return
@@ -764,10 +847,10 @@ func (w *TransportWrapper) tokens(ctx context.Context, attempt int,
 // strings.
 func (w *TransportWrapper) currentTokens() (access, refresh string) {
 	if w.accessToken != nil {
-		access = w.accessToken.Raw
+		access = w.accessToken.text
 	}
 	if w.refreshToken != nil {
-		refresh = w.refreshToken.Raw
+		refresh = w.refreshToken.text
 	}
 	return
 }
@@ -801,7 +884,7 @@ func (w *TransportWrapper) sendRefreshForm(ctx context.Context, attempt int) (co
 	form := url.Values{}
 	form.Set(grantTypeField, refreshTokenGrant)
 	form.Set(clientIDField, w.clientID)
-	form.Set(refreshTokenField, w.refreshToken.Raw)
+	form.Set(refreshTokenField, w.refreshToken.text)
 	code, result, err = w.sendForm(ctx, form, attempt)
 	return
 }
@@ -901,37 +984,64 @@ func (w *TransportWrapper) sendFormTimed(ctx context.Context, form url.Values) (
 		err = fmt.Errorf("token response status code is '%d'", response.StatusCode)
 		return
 	}
-	if result.TokenType != nil && *result.TokenType != "bearer" {
-		err = fmt.Errorf("expected 'bearer' token type but got '%s", *result.TokenType)
+	if result.TokenType != nil && !strings.EqualFold(*result.TokenType, "bearer") {
+		err = fmt.Errorf("expected 'bearer' token type but got '%s'", *result.TokenType)
 		return
 	}
 
 	// The response should always contains the access token, regardless of the kind of grant
 	// that was used:
-	var accessToken *jwt.Token
+	var accessTokenText string
+	var accessTokenObject *jwt.Token
+	var accessToken *tokenInfo
 	if result.AccessToken == nil {
 		err = fmt.Errorf("no access token was received")
 		return
 	}
-	accessToken, _, err = w.tokenParser.ParseUnverified(*result.AccessToken, jwt.MapClaims{})
+	accessTokenText = *result.AccessToken
+	accessTokenObject, _, err = w.tokenParser.ParseUnverified(
+		accessTokenText,
+		jwt.MapClaims{},
+	)
 	if err != nil {
 		return
 	}
+	if accessTokenText != "" {
+		accessToken = &tokenInfo{
+			text:   accessTokenText,
+			object: accessTokenObject,
+		}
+	}
 
-	// The refresh token isn't mandatory for the client credentials grant:
-	var refreshToken *jwt.Token
+	// The refresh token isn't mandatory for the password and client credentials grants:
+	var refreshTokenText string
+	var refreshTokenObject *jwt.Token
+	var refreshToken *tokenInfo
 	if result.RefreshToken == nil {
-		if form.Get(grantTypeField) != clientCredentialsGrant {
+		grantType := form.Get(grantTypeField)
+		if grantType != passwordGrant && grantType != clientCredentialsGrant {
 			err = fmt.Errorf("no refresh token was received")
 			return
 		}
 	} else {
-		refreshToken, _, err = w.tokenParser.ParseUnverified(
-			*result.RefreshToken,
+		refreshTokenText = *result.RefreshToken
+		refreshTokenObject, _, err = w.tokenParser.ParseUnverified(
+			refreshTokenText,
 			jwt.MapClaims{},
 		)
 		if err != nil {
-			return
+			w.logger.Debug(
+				ctx,
+				"Refresh token can't be parsed, will assume it is opaque: %v",
+				err,
+			)
+			err = nil
+		}
+	}
+	if refreshTokenText != "" {
+		refreshToken = &tokenInfo{
+			text:   refreshTokenText,
+			object: refreshTokenObject,
 		}
 	}
 
@@ -946,12 +1056,6 @@ func (w *TransportWrapper) sendFormTimed(ctx context.Context, form url.Values) (
 	return
 }
 
-// haveCredentials returns true if the connection has credentials that can be used to request new
-// tokens.
-func (w *TransportWrapper) haveCredentials() bool {
-	return w.havePassword() || w.haveSecret()
-}
-
 func (w *TransportWrapper) havePassword() bool {
 	return w.user != "" && w.password != ""
 }
@@ -961,8 +1065,8 @@ func (w *TransportWrapper) haveSecret() bool {
 }
 
 // debugExpiry sends to the log information about the expiration of the given token.
-func (w *TransportWrapper) debugExpiry(ctx context.Context, typ string, token *jwt.Token, expires bool,
-	left time.Duration) {
+func (w *TransportWrapper) debugExpiry(ctx context.Context, typ string, token *tokenInfo,
+	expires bool, left time.Duration) {
 	if token != nil {
 		if expires {
 			if left < 0 {
@@ -976,6 +1080,25 @@ func (w *TransportWrapper) debugExpiry(ctx context.Context, typ string, token *j
 	} else {
 		w.logger.Debug(ctx, "%s token isn't available", typ)
 	}
+}
+
+// parsePullSecretAccessToken will parse the supplied token to verify conformity
+// with that of a pull secret access token. A pull secret access token is of the
+// form <cluster id>:<Base64d pull secret token>.
+func parsePullSecretAccessToken(text string) error {
+	elems := strings.Split(text, ":")
+	if len(elems) != 2 {
+		return fmt.Errorf("Unparseable pull secret token")
+	}
+	_, err := uuid.Parse(elems[0])
+	if err != nil {
+		return fmt.Errorf("Unparseable pull secret token cluster ID")
+	}
+	_, err = base64.StdEncoding.DecodeString(elems[1])
+	if err != nil {
+		return fmt.Errorf("Unparseable pull secret token value")
+	}
+	return nil
 }
 
 // Names of fields in the token form:
