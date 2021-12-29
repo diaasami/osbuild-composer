@@ -1,6 +1,3 @@
-//go:build !windows
-// +build !windows
-
 /*
 Copyright (c) 2021 Red Hat, Inc.
 
@@ -17,17 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// This file contains the function that returns the trusted CA certificates for operating systems
-// other than Windows, where Go knows how to load the system trusted CA store.
+package authentication
 
-package internal
+import "github.com/golang-jwt/jwt"
 
-import (
-	"crypto/x509"
-)
-
-// loadSystemCAs loads the trusted CA certifites from the system trusted CA store.
-func loadSystemCAs() (pool *x509.CertPool, err error) {
-	pool, err = x509.SystemCertPool()
-	return
+// tokenInfo stores information about a token. We need to store both the original text and the
+// parsed objects because some tokens (refresh tokens in particular) may be opaque strings instead
+// of JSON web tokens.
+type tokenInfo struct {
+	text   string
+	object *jwt.Token
 }
