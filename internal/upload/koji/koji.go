@@ -2,6 +2,9 @@ package koji
 
 import (
 	"bytes"
+	"net"
+	"time"
+
 	// koji uses MD5 hashes
 	/* #nosec G501 */
 	"crypto/md5"
@@ -123,7 +126,17 @@ type loginReply struct {
 	SessionKey string `xmlrpc:"session-key"`
 }
 
-func newKoji(server string, transport http.RoundTripper, reply loginReply) (*Koji, error) {
+func newKoji(server string, transport http.RoundTripper, reply loginReply, relaxFactor uint) (*Koji, error) {
+	// Relax timeouts
+	t := transport.(*http.Transport)
+	if relaxFactor > 0 {
+		t.TLSHandshakeTimeout *= time.Duration(relaxFactor)
+		t.DialContext = (&net.Dialer{
+			Timeout:   30 * time.Second * time.Duration(relaxFactor),
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
+
 	// Create the final xmlrpc client with our custom RoundTripper handling
 	// sessionID, sessionKey and callnum
 	kojiTransport := &Transport{
@@ -170,7 +183,7 @@ func NewFromPlain(server, user, password string, transport http.RoundTripper) (*
 // NewFromGSSAPI creates a new Koji session authenticated using GSSAPI.
 // Principal and keytab used for the session is passed using credentials
 // parameter.
-func NewFromGSSAPI(server string, credentials *GSSAPICredentials, transport http.RoundTripper) (*Koji, error) {
+func NewFromGSSAPI(server string, credentials *GSSAPICredentials, transport http.RoundTripper, relaxFactor uint) (*Koji, error) {
 	// Create a temporary xmlrpc client with kerberos transport.
 	// The API doesn't require sessionID, sessionKey and callnum yet,
 	// so there's no need to use the custom Koji RoundTripper,
@@ -190,7 +203,7 @@ func NewFromGSSAPI(server string, credentials *GSSAPICredentials, transport http
 		return nil, err
 	}
 
-	return newKoji(server, transport, reply)
+	return newKoji(server, transport, reply, relaxFactor)
 }
 
 // GetAPIVersion gets the version of the API of the remote Koji instance

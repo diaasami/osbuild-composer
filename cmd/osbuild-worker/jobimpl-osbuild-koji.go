@@ -18,9 +18,10 @@ import (
 )
 
 type OSBuildKojiJobImpl struct {
-	Store       string
-	Output      string
-	KojiServers map[string]koji.GSSAPICredentials
+	Store              string
+	Output             string
+	KojiServers        map[string]koji.GSSAPICredentials
+	relaxTimeoutFactor uint
 }
 
 func (impl *OSBuildKojiJobImpl) kojiUpload(file *os.File, server, directory, filename string) (string, uint64, error) {
@@ -42,7 +43,7 @@ func (impl *OSBuildKojiJobImpl) kojiUpload(file *os.File, server, directory, fil
 		return "", 0, fmt.Errorf("Koji server has not been configured: %s", serverURL.Hostname())
 	}
 
-	k, err := koji.NewFromGSSAPI(server, &creds, transport)
+	k, err := koji.NewFromGSSAPI(server, &creds, transport, impl.relaxTimeoutFactor)
 	if err != nil {
 		return "", 0, err
 	}
