@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -35,8 +34,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ghodss/yaml"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v4"
+	"gopkg.in/yaml.v3"
 
 	"github.com/openshift-online/ocm-sdk-go/errors"
 	"github.com/openshift-online/ocm-sdk-go/logging"
@@ -145,11 +144,11 @@ func (b *HandlerBuilder) KeysInsecure(value bool) *HandlerBuilder {
 // ACLFile sets a file that contains items of the access control list. This should be a YAML file
 // with the following format:
 //
-// - claim: email
-//   pattern: ^.*@redhat\.com$
+//   - claim: email
+//     pattern: ^.*@redhat\.com$
 //
-// - claim: sub
-//   pattern: ^f:b3f7b485-7184-43c8-8169-37bd6d1fe4aa:myuser$
+//   - claim: sub
+//     pattern: ^f:b3f7b485-7184-43c8-8169-37bd6d1fe4aa:myuser$
 //
 // The claim field is the name of the claim of the JWT token that will be checked. The pattern field
 // is a regular expression. If the claim matches the regular expression then access will be allowed.
@@ -388,14 +387,14 @@ func (b *HandlerBuilder) Build() (handler *Handler, err error) {
 
 // aclItem is the type used to read a single ACL item from a YAML document.
 type aclItem struct {
-	Claim   string `json:"claim"`
-	Pattern string `json:"pattern"`
+	Claim   string `yaml:"claim"`
+	Pattern string `yaml:"pattern"`
 }
 
 // loadACLFile loads the given ACL file into the given map of ACL items.
 func (b *HandlerBuilder) loadACLFile(file string, items map[string]*regexp.Regexp) error {
 	// Load the YAML data:
-	yamlData, err := ioutil.ReadFile(file) // nolint
+	yamlData, err := os.ReadFile(file) // nolint
 	if err != nil {
 		return err
 	}
@@ -505,7 +504,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add the token to the context:
-	ctx = ContextWithToken(ctx, token)
+	ctx = ContextWithToken(ctx, token.object)
 	r = r.WithContext(ctx)
 
 	// Call the next handler:
@@ -622,7 +621,7 @@ func (h *Handler) loadKeysURL(ctx context.Context, addr string) error {
 // readKeys reads the keys from JSON web key set available in the given reader.
 func (h *Handler) readKeys(ctx context.Context, reader io.Reader) error {
 	// Read the JSON data:
-	jsonData, err := ioutil.ReadAll(reader)
+	jsonData, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
@@ -728,18 +727,22 @@ func (h *Handler) parseKey(data keyData) (key interface{}, err error) {
 // checkToken checks if the token is valid. If it is valid it returns the parsed token, the
 // claims and true. If it isn't valid it sends an error response to the client and returns false.
 func (h *Handler) checkToken(w http.ResponseWriter, r *http.Request,
-	bearer string) (token *jwt.Token, claims jwt.MapClaims, ok bool) {
+	bearer string) (token *tokenInfo, claims jwt.MapClaims, ok bool) {
 	// Get the context:
 	ctx := r.Context()
 
 	// Parse the token:
 	claims = jwt.MapClaims{}
-	token, err := h.tokenParser.ParseWithClaims(
+	object, err := h.tokenParser.ParseWithClaims(
 		bearer, claims,
 		func(token *jwt.Token) (key interface{}, err error) {
 			return h.selectKey(ctx, token)
 		},
 	)
+	token = &tokenInfo{
+		text:   bearer,
+		object: object,
+	}
 	if err != nil {
 		switch typed := err.(type) {
 		case *jwt.ValidationError:
@@ -828,18 +831,26 @@ func (h *Handler) checkToken(w http.ResponseWriter, r *http.Request,
 // something is wrong it sends an error response to the client and returns false.
 func (h *Handler) checkClaims(w http.ResponseWriter, r *http.Request,
 	claims jwt.MapClaims) bool {
-	// Check the token type:
-	typ, ok := h.checkStringClaim(w, r, claims, "typ")
-	if !ok {
-		return false
-	}
-	if !strings.EqualFold(typ, "Bearer") {
-		h.sendError(
-			w, r,
-			"Bearer token type '%s' isn't supported",
-			typ,
-		)
-		return false
+	// The `typ` claim is optional, but if it exists the value must be `Bearer`:
+	value, ok := claims["typ"]
+	if ok {
+		typ, ok := value.(string)
+		if !ok {
+			h.sendError(
+				w, r,
+				"Bearer token type claim contains incorrect string value '%v'",
+				value,
+			)
+			return false
+		}
+		if !strings.EqualFold(typ, "Bearer") {
+			h.sendError(
+				w, r,
+				"Bearer token type '%s' isn't allowed",
+				typ,
+			)
+			return false
+		}
 	}
 
 	// Check the format of the issue and expiration date claims:
@@ -853,7 +864,7 @@ func (h *Handler) checkClaims(w http.ResponseWriter, r *http.Request,
 	}
 
 	// Make sure that the impersonation flag claim doesn't exist, or is `false`:
-	value, ok := claims["impersonated"]
+	value, ok = claims["impersonated"]
 	if ok {
 		flag, ok := value.(bool)
 		if !ok {
@@ -894,27 +905,6 @@ func (h *Handler) checkTimeClaim(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	result = time.Unix(int64(seconds), 0)
-	return
-}
-
-// checkStringClaim checks that the given claim exists and that the value is a string. If it doesn't
-// exist or it has a wrong type it sends an error response to the client and returns false. If it
-// exists it returns its value and true.
-func (h *Handler) checkStringClaim(w http.ResponseWriter, r *http.Request,
-	claims jwt.MapClaims, name string) (result string, ok bool) {
-	value, ok := h.checkClaim(w, r, claims, name)
-	if !ok {
-		return
-	}
-	result, ok = value.(string)
-	if !ok {
-		h.sendError(
-			w, r,
-			"Bearer token claim '%s' contains incorrect text value '%v'",
-			name, value,
-		)
-		return
-	}
 	return
 }
 
